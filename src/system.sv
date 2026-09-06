@@ -24,17 +24,30 @@ module system (
     input         mgmt_write,
     input  [15:0] mgmt_writedata,
 
-    // SDRAM interface
-    inout  [15:0] sdram_dq,
-    output [12:0] sdram_a,
-    output [1:0]  sdram_ba,
-    output [1:0]  sdram_dqm,
-    output        sdram_nwe,
-    output        sdram_nras,
-    output        sdram_ncas,
-    output        sdram_ncs,
-    output        sdram_cke,
-    input         refresh_allowed,
+    // Vendor-neutral guest-memory backend. KV260 maps both requesters into its
+    // unified DDR master; the DE10-Nano wrapper maps them to physical SDRAM.
+    input         ext_mem_busy,
+    output [31:0] ext_mem0_addr,
+    output [31:0] ext_mem0_din,
+    input  [31:0] ext_mem0_dout,
+    input         ext_mem0_resp_valid,
+    input [127:0] ext_mem0_line_dout,
+    input         ext_mem0_line_resp_valid,
+    output  [3:0] ext_mem0_be,
+    output  [7:0] ext_mem0_burstcount,
+    output        ext_mem0_line_read,
+    input         ext_mem0_ready,
+    output        ext_mem0_valid,
+    output        ext_mem0_write,
+    output [31:0] ext_mem1_addr,
+    output [31:0] ext_mem1_din,
+    input  [31:0] ext_mem1_dout,
+    input         ext_mem1_resp_valid,
+    output  [3:0] ext_mem1_be,
+    output  [7:0] ext_mem1_burstcount,
+    input         ext_mem1_ready,
+    output        ext_mem1_valid,
+    output        ext_mem1_write,
 
     // Shared HPS DDR window. Main_MiSTer stages ROMs at SHMEM 0x300C0000.
     input         ddram_busy,
@@ -123,7 +136,6 @@ module system (
 
 	input   [5:0] bootcfg,
     input   [1:0] ram_size,       // 0/1/2/3 = 16/32/64/128MB exposed to software
-    input   [1:0] sdram_size,     // 1/2/3 = detected 32/64/128MB module geometry
     input         uma_ram,
 	input   [1:0] cpu_speed_osd,  // 0=full, 1=15, 2=30, 3=56 MHz
 	output  [7:0] syscfg,
@@ -137,6 +149,14 @@ module system (
 	output wire [7:0]  video_b,
 	input              video_f60,     // force VGA timing to 60 Hz; 0 preserves native refresh
 	input              video_border,	// show VGA overscan border (OSD)
+	input              video_scanline_req,
+	output             video_scanline_ready,
+	input              video_scanline_frame_start,
+	input      [10:0]  video_scanline_y,
+	output     [10:0]  video_scanline_width,
+	output     [10:0]  video_scanline_height,
+	output     [31:0]  video_native_frames,
+	output             video_scanline_done,
 
 	// SVGA framebuffer descriptor (from vga.v) -> MiSTer HPS framebuffer path
 	output wire [19:0] video_start_addr,
@@ -190,16 +210,32 @@ module system (
     output            cpu_vm,
     output     [15:0] cpu_cs,
     output     [31:0] cpu_eip,
-    output     [31:0] cpu_cs_base
+    output     [31:0] cpu_cs_base,
+
+    // Optional SST-1 host aperture. On KV260 this connects directly to zSST;
+    // DE10-Nano explicitly disables ENABLE_VOODOO and prunes this path.
+    output            zsst_host_req_valid,
+    input             zsst_host_req_ready,
+    output     [23:0] zsst_host_address,
+    output     [31:0] zsst_host_writedata,
+    output      [3:0] zsst_host_byteenable,
+    output            zsst_host_write,
+    input             zsst_host_rsp_valid,
+    output            zsst_host_rsp_ready,
+    input      [31:0] zsst_host_readdata,
+    input             zsst_host_error,
+    output            zsst_memory_enable,
+    output     [31:0] zsst_init_enable
 );
 
 parameter SYS_FREQ = 50_000_000;
-parameter SDRAM_HAS_DQM = 1'b1;
-parameter SDRAM_FAST_GRADE = 1'b1;
 parameter DCACHE_SET_BITS = 8;   // dcache size: 8 = 16KB, 7 = 8KB
 parameter ICACHE_SET_BITS = 8;   // icache size: 8 = 16KB, 7 = 8KB
 parameter ENABLE_X87 = 1'b0;
 parameter ENABLE_CMS = 1'b1;
+parameter VGA_USE_URAM = 1'b0;
+parameter VGA_ONDEMAND_SCANOUT = 1'b0;
+parameter ENABLE_VOODOO = 1'b0;
 localparam [6:0] CPU_CLOCK_MHZ = SYS_FREQ / 1_000_000;
 
 assign cpu_pe      = debug_cpu_pe;
@@ -312,12 +348,15 @@ wire        irq_0, irq_1, irq_2, irq_3, irq_4,
 wire [31:2] cpu_addr;
 wire  [3:0] cpu_be;
 wire  [7:0] cpu_burstcount;
+wire        cpu_line_read;
 wire [31:0] cpu_din_z;
 wire [31:0] cpu_dout_z;
 wire        cpu_valid, cpu_write;
 wire        cpu_io_sig;
 wire        cpu_ready;
 wire        cpu_resp_valid;
+wire [127:0] cpu_line_din;
+wire        cpu_line_resp_valid;
 wire        cpu_intr;
 wire        cpu_inta;
 
@@ -384,6 +423,13 @@ wire  [7:0] mpu_readdata;
 wire  [7:0] dma_io_readdata;
 wire  [7:0] pic_readdata;
 wire  [7:0] vga_io_readdata;
+wire  [7:0] zsst_pci_readdata;
+wire        zsst_pci_chip_select_raw;
+wire        zsst_pci_chip_select = ENABLE_VOODOO &&
+                                    zsst_pci_chip_select_raw;
+wire        zsst_pci_memory_enable;
+wire [31:0] zsst_pci_bar0_base;
+wire [31:0] zsst_pci_init_enable;
 
 // CPU-facing external memory request bundle. z486 owns the L1 internally, so
 // this is the cache-fill/write-through bus, not a SoC-side cache request.
@@ -393,6 +439,7 @@ wire [31:0] avm_readdata;
 wire  [3:0] avm_byteenable;
 wire        avm_write;
 wire        avm_valid;
+wire        avm_line_read;
 wire        avm_ready;
 wire        avm_readdatavalid;
 wire        mem_bus_ready;
@@ -402,6 +449,9 @@ wire [31:0] mem_address;
 wire [31:0] mem_din;
 wire [31:0] mem_dout;
 wire        mem_resp_valid;
+wire [127:0] mem_line_dout;
+wire        mem_line_resp_valid;
+wire        mem_line_read;
 wire [3:0]  mem_be;
 wire [7:0]  mem_burstcount;
 wire        mem_ready;
@@ -434,20 +484,27 @@ z486 #(
     .DCACHE_SET_BITS(DCACHE_SET_BITS),
     .ICACHE_SET_BITS(ICACHE_SET_BITS),
     .ENABLE_X87(ENABLE_X87),
+    .ENABLE_DEVICE_MMIO(ENABLE_VOODOO),
+    .DEVICE_MMIO_MASK(32'hff00_0000),
     .CLOCK_RATE_MHZ(CPU_CLOCK_MHZ)
 ) z486_cpu (
     .clk               (clk_sys),
     .reset_n           (cpu_reset_n),
+    .device_mmio_enable(zsst_pci_memory_enable),
+    .device_mmio_base  (zsst_pci_bar0_base),
     .addr              (cpu_addr),
     .be                (cpu_be),
     .burstcount        (cpu_burstcount),
+    .line_read         (cpu_line_read),
     .din               (cpu_din_z),
+    .line_din          (cpu_line_din),
     .dout              (cpu_dout_z),
     .valid             (cpu_valid),
     .write             (cpu_write),
     .io                (cpu_io_sig),
     .ready             (cpu_ready),
     .resp_valid        (cpu_resp_valid),
+    .line_resp_valid   (cpu_line_resp_valid),
     .intr              (cpu_intr),
     .nmi               (1'b0),
     .inta              (cpu_inta),
@@ -477,6 +534,9 @@ assign cpu_ready = cpu_inta ? inta_ready :
 assign cpu_resp_valid = cpu_inta ? inta_ready :
                         cpu_io_sig ? io_bus_ready :
                         mem_bus_resp_valid;
+assign cpu_line_din = mm_line_dout;
+assign cpu_line_resp_valid = boot_done && !cpu_inta && !cpu_io_sig &&
+                             mm_line_resp_valid;
 
 // ============================================================================
 // PIC INTA Bridge
@@ -507,6 +567,9 @@ wire is_bios_mirror_alias = &cpu_byte_addr_raw[31:18];    // 0xFFFC0000+
 wire [31:0] cpu_byte_addr = is_bios_mirror_alias
                           ? (BIOS_MIRROR_BASE + {14'd0, cpu_byte_addr_raw[17:0]})
                           : cpu_byte_addr_raw;
+wire cpu_zsst_hit = ENABLE_VOODOO && zsst_pci_memory_enable &&
+                    ((cpu_byte_addr & 32'hff00_0000) ==
+                     (zsst_pci_bar0_base & 32'hff00_0000));
 
 // z486 owns the L1 internally, so UMA write-protect is handled at the CPU/cache
 // boundary through PROTECT_UMA_ROM. Nothing is bypassed here.
@@ -516,11 +579,14 @@ wire cpu_mem_bypass = 1'b0;
 // cache lookup and fill sequencing internally.
 assign avm_address     = cpu_byte_addr;
 assign avm_writedata   = cpu_dout_z;
-assign avm_readdata    = mm_dout;
+assign avm_readdata    = zsst_read_pending ? zsst_host_readdata : mm_dout;
 assign avm_byteenable  = cpu_be;
-assign avm_valid       = boot_done && cpu_mem_valid && !cpu_mem_bypass;
+assign avm_valid       = boot_done && cpu_mem_valid && !cpu_mem_bypass &&
+                         !cpu_zsst_hit;
+assign avm_line_read   = cpu_line_read;
 assign avm_write       = cpu_mem_write;
-assign avm_ready       = boot_done ? mm_ready : 1'b0;
+assign avm_ready       = boot_done ?
+                         (cpu_zsst_hit ? zsst_host_req_ready : mm_ready) : 1'b0;
 assign avm_readdatavalid = boot_done ? mm_resp_valid : 1'b0;
 
 reg mem_rom_wr_ready;
@@ -532,15 +598,42 @@ always @(posedge clk_sys) begin
 end
 
 wire vga_wr_done;    // unused in ready path, still connected to main_memory output
-wire mem_bus_resp_valid = avm_readdatavalid;
+reg zsst_read_pending;
+wire zsst_read_response = zsst_read_pending && zsst_host_rsp_valid;
+wire mem_bus_resp_valid = avm_readdatavalid | zsst_read_response;
 assign mem_bus_ready = avm_ready | mem_rom_wr_ready;
+
+assign zsst_host_req_valid  = ENABLE_VOODOO && boot_done && cpu_mem_valid &&
+                              cpu_zsst_hit;
+assign zsst_host_address    = cpu_byte_addr[23:0];
+assign zsst_host_writedata  = cpu_dout_z;
+assign zsst_host_byteenable = cpu_be;
+assign zsst_host_write      = cpu_mem_write;
+assign zsst_host_rsp_ready  = 1'b1;
+assign zsst_memory_enable   = zsst_pci_memory_enable;
+assign zsst_init_enable     = zsst_pci_init_enable;
+
+always @(posedge clk_sys) begin
+    if (reset)
+        zsst_read_pending <= 1'b0;
+    else begin
+        if (zsst_host_req_valid && zsst_host_req_ready &&
+            !zsst_host_write)
+            zsst_read_pending <= 1'b1;
+        if (zsst_read_response)
+            zsst_read_pending <= 1'b0;
+    end
+end
 
 // Main memory wires. During boot the SD boot writer owns this port; after boot
 // it is driven by z486's external cache-fill/write-through bus.
 wire [31:0] mm_addr, mm_din, mm_dout;
 wire  [3:0] mm_be;
 wire  [7:0] mm_burstcount;
+wire        mm_line_read;
 wire        mm_valid, mm_write, mm_ready, mm_resp_valid;
+wire [127:0] mm_line_dout;
+wire         mm_line_resp_valid;
 wire        dma_mem_ready;  // forward declaration (used in snoop_valid below)
 
 // Mux: during boot, the SD boot writer goes directly to main_memory; after
@@ -549,6 +642,7 @@ assign mm_addr       = boot_done ? avm_address       : sd_avm_address;
 assign mm_din        = boot_done ? avm_writedata     : sd_avm_writedata;
 assign mm_be         = boot_done ? avm_byteenable    : sd_avm_byteenable;
 assign mm_burstcount = boot_done ? cpu_burstcount    : 8'd1;
+assign mm_line_read  = boot_done ? avm_line_read     : 1'b0;
 assign mm_valid      = boot_done ? avm_valid         : sd_avm_write;
 assign mm_write      = boot_done ? avm_write         : 1'b1;
 
@@ -571,8 +665,11 @@ main_memory main_memory (
     .cpu_din           (mm_din),
     .cpu_dout          (mm_dout),
     .cpu_resp_valid    (mm_resp_valid),
+    .cpu_line_dout     (mm_line_dout),
+    .cpu_line_resp_valid(mm_line_resp_valid),
     .cpu_be            (mm_be),
     .cpu_burstcount    (mm_burstcount),
+    .cpu_line_read     (mm_line_read),
     .cpu_ready         (mm_ready),
     .cpu_valid         (mm_valid),
     .cpu_write         (mm_write),
@@ -583,8 +680,11 @@ main_memory main_memory (
 	.mem_din           (mem_din),
 	.mem_dout          (mem_dout),
 	.mem_resp_valid    (mem_resp_valid),
+	.mem_line_dout     (mem_line_dout),
+	.mem_line_resp_valid(mem_line_resp_valid),
 	.mem_be            (mem_be),
 	.mem_burstcount    (mem_burstcount),
+	.mem_line_read     (mem_line_read),
 	.mem_ready         (mem_ready),
 	.mem_valid         (mem_valid),
 	.mem_write         (mem_we),
@@ -618,8 +718,7 @@ main_memory main_memory (
 );
 
 // CPU → SDRAM port 0: main_memory holds signals stable until accepted
-wire        mem_busy;    // SDRAM initialization busy (used by boot loader)
-wire [26:0] mem_addr_word = mem_address[26:0];
+wire        mem_busy;    // memory initialization busy (used by boot loader)
 
 // DMA → SDRAM port 1
 // (dma_mem_ready declared above, before l1_cache)
@@ -665,65 +764,30 @@ wire [31:0] dma_mem_din = dma_held_16bit ?
     (dma_held_addr[1] ? {dma_held_data, 16'h0000} : {16'h0000, dma_held_data}) :
     ({24'h0, dma_held_data[7:0]} << {dma_held_addr[1:0], 3'b000});
 
-sdram #(
-    .FREQ(SYS_FREQ),
-    .HAS_DQM(SDRAM_HAS_DQM),
-    .FAST_GRADE(SDRAM_FAST_GRADE)
-) sdram (
-	.clk               (clk_sys),
-	.nce               (1'b0),
-	.resetn            (~reset),
-	.refresh_allowed   (1'b1),
-	.busy              (mem_busy),
-	.sdram_size        (sdram_size),
+assign ext_mem0_addr       = mem_address;
+assign ext_mem0_din        = mem_din;
+assign ext_mem0_be         = mem_be;
+assign ext_mem0_burstcount = mem_burstcount;
+assign ext_mem0_line_read   = mem_line_read;
+assign ext_mem0_valid      = mem_valid;
+assign ext_mem0_write      = mem_we;
 
-	// port 0 - CPU (via main_memory, valid/ready)
-	.valid0            (mem_valid),
-	.ready0            (mem_ready),
-	.wr0               (mem_we),
-	.addr0             (mem_addr_word),
-	.din0              (mem_din),
-	.dout0             (mem_dout),
-	.resp_valid0       (mem_resp_valid),
-	.be0               (mem_be),
-	.burst_cnt0        (mem_burstcount[3:0]),
-	.burst_done0       (),
+assign ext_mem1_addr       = {8'h00, dma_held_addr};
+assign ext_mem1_din        = dma_mem_din;
+assign ext_mem1_be         = dma_mem_be;
+assign ext_mem1_burstcount = 8'd1;
+assign ext_mem1_valid      = dma_held_valid;
+assign ext_mem1_write      = dma_held_wr;
 
-	// port 1 - DMA (valid/ready with hold register)
-	.valid1            (dma_held_valid),
-	.ready1            (dma_mem_ready),
-	.wr1               (dma_held_wr),
-	.addr1             ({3'b000, dma_held_addr}),
-	.din1              (dma_mem_din),
-	.dout1             (dma_mem_dout),
-	.resp_valid1       (dma_mem_resp_valid),
-	.be1               (dma_mem_be),
-	.burst_cnt1        (4'd1),
-	.burst_done1       (),
-
-	// port 2 - unused
-	.valid2            (1'b0),
-	.ready2            (),
-	.wr2               (1'b0),
-	.addr2             (27'd0),
-	.din2              (32'd0),
-	.dout2             (),
-	.resp_valid2       (),
-	.be2               (4'd0),
-	.burst_cnt2        (4'd0),
-	.burst_done2       (),
-
-	// SDRAM side interface
-    .SDRAM_DQ          (sdram_dq),
-    .SDRAM_A           (sdram_a),
-    .SDRAM_DQM         (sdram_dqm),
-    .SDRAM_BA          (sdram_ba),
-    .SDRAM_nWE         (sdram_nwe),
-    .SDRAM_nRAS        (sdram_nras),
-    .SDRAM_nCAS        (sdram_ncas),
-    .SDRAM_nCS         (sdram_ncs),
-    .SDRAM_CKE         (sdram_cke)
-);
+assign mem_busy           = ext_mem_busy;
+assign mem_ready          = ext_mem0_ready;
+assign mem_dout           = ext_mem0_dout;
+assign mem_resp_valid     = ext_mem0_resp_valid;
+assign mem_line_dout      = ext_mem0_line_dout;
+assign mem_line_resp_valid = ext_mem0_line_resp_valid;
+assign dma_mem_ready      = ext_mem1_ready;
+assign dma_mem_dout       = ext_mem1_dout;
+assign dma_mem_resp_valid = ext_mem1_resp_valid;
 
 // DMA → SDRAM port 1: Avalon-MM master holds signals stable while waitrequest
 // Latch write flag on acceptance for resp_valid tracking
@@ -743,6 +807,7 @@ assign dma_readdata      = dma_held_16bit ?
                       : {8'h0, dma_held_addr[0] ? dma_mem_dout[15:8]  : dma_mem_dout[7:0]});
 
 wire [7:0] iobus_readdata8 =
+	( zsst_pci_chip_select                    ) ? zsst_pci_readdata :
 	( ide0_cs|ide1_cs                        ) ? (ide0_cs ? ide0_readdata[7:0] : ide1_readdata[7:0]) :
 	( floppy0_cs                             ) ? floppy0_readdata  :
 	( dma_master_cs|dma_slave_cs|dma_page_cs ) ? dma_io_readdata   :
@@ -788,6 +853,28 @@ iobus_adapter iobus_adapter (
     .direct_readdata   (8'hFF),
     .direct_handled    (1'b0)
 );
+
+`ifdef Z486_VOODOO
+zsst_pci_config zsst_pci_config (
+    .clk(clk_sys),
+    .reset_n(~rst[0] && ENABLE_VOODOO),
+    .io_address(iobus_address),
+    .io_read(iobus_read),
+    .io_write(iobus_write),
+    .io_writedata(iobus_writedata_byte),
+    .io_readdata(zsst_pci_readdata),
+    .io_chip_select(zsst_pci_chip_select_raw),
+    .memory_enable(zsst_pci_memory_enable),
+    .bar0_base(zsst_pci_bar0_base),
+    .init_enable(zsst_pci_init_enable)
+);
+`else
+assign zsst_pci_readdata = 8'hff;
+assign zsst_pci_chip_select_raw = 1'b0;
+assign zsst_pci_memory_enable = 1'b0;
+assign zsst_pci_bar0_base = 32'd0;
+assign zsst_pci_init_enable = 32'd0;
+`endif
 
 // Chip-selects must be combinational (iobus_adapter asserts io_write/io_read
 // for only 1 cycle, so registered CS would arrive 1 cycle late)
@@ -1184,7 +1271,10 @@ sound #(
 );
 
 // MiSTer uses a normal streaming VGA source, so use the original ao486 vga.v
-vga vga_inst
+vga #(
+	.USE_URAM(VGA_USE_URAM),
+	.ONDEMAND_SCANOUT(VGA_ONDEMAND_SCANOUT)
+) vga_inst
 (
 	.clk_sys           (clk_sys),
 	.rst_n             (~rst[9]),
@@ -1231,8 +1321,16 @@ vga vga_inst
 	.vga_write_mode    (video_write_mode),
 	.vga_stride        (video_stride),
 	.vga_off           (video_off),
-	.vga_lores         (1'b0),
-	.vga_border        (video_border)
+	.vga_lores         (VGA_ONDEMAND_SCANOUT),
+	.vga_border        (video_border),
+	.scanline_req_valid(video_scanline_req),
+	.scanline_req_ready(video_scanline_ready),
+	.scanline_frame_start(video_scanline_frame_start),
+	.scanline_y        (video_scanline_y),
+	.scanline_width    (video_scanline_width),
+	.scanline_height   (video_scanline_height),
+	.scanline_native_frames(video_native_frames),
+	.scanline_done     (video_scanline_done)
 );
 
 
