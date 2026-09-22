@@ -48,7 +48,7 @@ Cortex-A9 800 MHz 코어 하나의 몇 % 수준이다(DOSBox GUS는 더 느린 A
 │                                └ 상태 블록 읽기 ◄──┼── 상태   │ └ PCM → ALSA              │
 │ ddr_arb: boot / framebuffer / gus ─► DDRAM 포트    │          └────────────┬─────────────┘
 │                                                    │                       │
-│ audio mixer ◄──────────────── alsa_l/r ◄───────────┼── sys/alsa.sv ◄───────┘ (ALSA 버퍼)
+│ (sys_top) audio_out ◄──────── alsa_l/r ◄───────────┼── sys/alsa.sv ◄───────┘ (ALSA 버퍼)
 └───────────────────────────────────────────────────┘
 ```
 
@@ -175,7 +175,7 @@ CPU가 보이스 레지스터를 쓴 직후 HPS가 **그 쓰기 이전 기준으
 | `src/system.sv` | `gus_cs` 디코드, `iobus_readdata8` mux 추가, `ddr_arb`, PIC/DMA 연결 |
 | `src/soc/gus/gus_front.sv` (신규) | 5.1–5.5절 |
 | `src/soc/gus/gus_ddr.sv` (신규) | 샘플 RAM 접근, 로그 기록, 상태/이벤트 폴링 |
-| `z486_mister.sv` | OSD 항목, `alsa_l/r`을 믹서 볼륨에 연결 |
+| `z486_mister.sv` | OSD 항목. ALSA 출력은 `sys/sys_top.v`의 `audio_out`이 코어 오디오와 섞으므로(`sys/audio_out.v`) 코어에서 따로 연결하지 않는다 |
 
 OSD 항목(제안):
 - `GUS: Off / On`, `GUS base: 240h / 220h / 260h` (220h는 내장 SB와 겹치므로 SB를 끌 때만)
