@@ -88,6 +88,33 @@ LAD/LFRAME/LCLK 옆에 GND 핀을 최대한 둔다.
 CPLD는 LAD/LFRAME#를 **입력으로만** 모니터링한다(리셋 명령 감지).
 LAD/LFRAME/LCLK는 CPLD를 거치지 않고 F85226에 직결한다.
 
+### 2.4 대안: 추가 FPGA 핀을 끌어와서 CPLD 없이 구성 (검토 중)
+
+- **RTC 보드 헤더(DE10-nano LTC 커넥터)는 HPS 핀이다.** FPGA 패브릭에서 직접 쓸 수 없다.
+  Cyclone V의 HPS Loan I/O로 빌려 올 수는 있지만, MiSTer 전체의 HPS 핀 설정(preloader)을
+  바꿔야 하고 RTC 기능과도 충돌하므로 제외한다.
+- **Arduino 헤더의 "I/O ALT" 핀은 FPGA 핀이다**(`sys/sys.tcl`, `sys/sys_top.v:98-106`).
+  User port와 같은 3.3 V 뱅크 계열이다.
+
+  | 포트 | 핀 | MiSTer에서의 용도 | 비우면 잃는 기능 |
+  |---|---|---|---|
+  | `SD_SPI_CS` | AE15 | 보조 SD CS, sync-on-green 제어 | 보조 SD, SOG → **피한다** |
+  | `SD_SPI_MISO` | AH8 | 보조 SD | 보조 SD |
+  | `SD_SPI_CLK` | AG8 | 보조 SD | 보조 SD |
+  | `SD_SPI_MOSI` | U13 | 보조 SD | 보조 SD |
+  | `IO_SCL`/`IO_SDA` | U14/AG9 | I/O 보드 v6+ MCP23009(버튼/LED) | I/O 보드 버튼/LED, MCP 감지 |
+  | `SDCD_SPDIF` | AH7 | SD 카드 감지, S/PDIF | 보조 SD 감지, S/PDIF 출력 |
+
+- 2핀(예: `SD_SPI_CLK` → SERIRQ, `SD_SPI_MOSI` → LDRQ#)을 더하면 9핀으로 **LPC 전체를 FPGA가
+  직접 구동**할 수 있다. User port 7핀은 LCLK, LFRAME#, LAD[3:0], LRESET#가 된다.
+  CPLD, SIDEBAND 프레임, DRQ_SEQ는 필요 없어진다(4.2–4.5절은 FPGA 안의 SERIRQ 호스트와
+  LDRQ 디코더로 대체된다).
+- 대가:
+  - I/O 보드가 꽂혀 있으면 해당 신호가 I/O 보드의 SD 슬롯 등에 연결된 상태다.
+    신호를 끌어내려면 스태킹 헤더나 점퍼선이 필요하고, SD 슬롯 쪽 배선이 스텁으로 남는다.
+  - `sys_top.v`의 해당 핀 로직을 매크로로 끊어야 한다(보조 SD 비활성).
+  - SERIRQ와 LDRQ#도 LCLK에 동기화된 신호라서 User port 쪽 배선과 길이를 비슷하게 맞춘다(수 ns 이내).
+
 ## 3. 물리 계층
 
 ### 3.1 sys_top 수정 (필수)
@@ -259,10 +286,14 @@ keep  : SYNC=Ready More(1001)로 끝났을 때 (디맨드/블록 전송)
 변경:
 
 1. `system.sv`에 `int_claimed`를 만든다. 내부 칩셀렉트를 모두 OR한 값이다(`ide0/1`, `floppy0`,
-   `dma_*`, `pic_*`, `pit`, `ps2_*`, `rtc`, `fm`, `sb`, `mpu`, `joy`, `uart1/2`, `vga_*`,
+   `dma_*`, `pic_*`, `pit`, `ps2_*`, `rtc`, `fm`, `sb`, `mpu`, `joy`, `vga_*`,
    `debug_port`, `speedctl`, `zsst_pci`).
-   `speedctl_cs`(8888h)와 `uart*_cs`는 지금 읽기 mux에 없으므로 빠뜨리지 않도록 주의한다.
+   `speedctl_cs`(8888h)는 읽기 mux에 없으므로 빠뜨리지 않도록 주의한다.
+   `uart1_cs`/`uart2_cs`는 디코드만 되고 연결된 UART가 없으므로 **넣지 않는다**
+   (외장 시리얼 카드가 3F8h/2F8h를 쓸 수 있게).
 2. `ext_io_sel = lpc_enable & ~int_claimed` (subtractive decode, 실제 칩셋의 ISA 브리지와 같은 방식).
+   예외: 포트 80h는 `dma_page_cs`(80h–8Fh)에 들어가 있지만, 실제 칩셋처럼
+   **80h 쓰기는 내부와 LPC에 동시에** 보낸다(POST 카드용, 옵션).
 3. `iobus_adapter`에 `io_ext_sel`, `io_ext_ready` 포트를 추가한다.
    - ISSUE에서 `io_ext_sel`이면 `lpc_host`에 요청을 넣고, WAIT 상태에서
      `io_ext_ready`까지 머문다. 읽기는 `lpc_host` 데이터를 캡처한다.
@@ -338,6 +369,40 @@ transfer==0 (Verify), ext:
   - `LPC clock: 28 MHz / 21 MHz`
 - `status` 비트 할당은 구현할 때 정한다.
 
+### 5.6 내부 장치와의 충돌
+
+현재 코드 기준 내부 장치의 점유 자원(`src/system.sv:880-906`, `1355-1372`, `dma` 인스턴스):
+
+| 자원 | 내부 점유 | 외장 카드에 쓸 수 있는 것 |
+|---|---|---|
+| I/O | 000–00F, 020–021, 040–043, 060–067, 061, 070–071, 080–08F, 090–09F, 0A0–0A1, 0C0–0DF, 170–177, 1F0–1F7, 201, 220–22F, 330–331, 376, 388–38B, 3B0–3DF, 3F0–3F7, 3F6, 402, 8888–8889, (Voodoo 빌드: CF8–CFF) | 나머지 전부. 3F8/2F8(COM)은 디코드만 되고 장치가 없으므로 외장 가능 |
+| IRQ | 0 PIT, 1 KBD, 2→9 VGA, 5/7/10 내장 사운드, 6 FDC, 8 RTC, 12 마우스, 14/15 IDE | **3, 4, 11** 은 비어 있음. 9는 VGA IRQ2와 공유. 내장 SB를 끄면 5/7/10 |
+| DMA | 1 / 5 내장 SB, 2 FDC | **0, 3, 6, 7** 은 비어 있음. 내장 SB를 끄면 1/5 |
+| 메모리 | A0000–BFFFF VGA, BIOS 영역 | ISA 메모리 사이클 미지원(7절) |
+
+충돌 형태와 대응:
+
+1. **I/O 포트가 겹치는 경우**: subtractive decode에서는 내부 장치가 이기므로
+   외장 카드는 읽기도 쓰기도 **받지 못한다**(버스 충돌이나 하드웨어 손상은 없고,
+   외장 카드가 안 보이는 것뿐이다). Sound Blaster를 쓸 때는 OSD에서 외장 사운드를
+   켜서 `sb_cs`, `fm_cs`(OPL 388h), `mpu_cs`(330h)를 막아야 한다. SB 카드의 게임 포트를
+   쓰려면 `joy_cs`(201h)도 막는다. 내장 CMS는 220h 범위라 `sb_cs`와 함께 꺼진다.
+2. **10-bit 주소 별칭**: ISA 카드는 대개 A0–A9만 디코드한다. 400h 이상의
+   외부로 나가는 포트는 하위 10비트 별칭으로 카드에 도착한다(실제 하드웨어와 동일).
+   예를 들어 내부가 쓰는 8888h(speedctl)는 LPC로 나가지 않으므로 별칭 문제가 없다.
+3. **IRQ 공유**: z486 PIC은 에지 트리거라서, 같은 IRQ를 내부와 외부가 OR로 함께 구동하면
+   한쪽이 High인 동안 다른 쪽의 에지가 사라진다. `ext_irq_mask`로 **외장 카드에 준 IRQ만** 열고,
+   같은 IRQ를 쓰는 내부 장치는 반드시 끈다. OSD에서 내부 SB가 켜진 상태로
+   외장 IRQ 5/7/10을 여는 조합은 막는다.
+4. **DMA 채널 공유**: 같은 채널에 내부/외부 요청을 동시에 두면 전송이 섞인다.
+   채널별 `ext[ch]`는 내부 요청을 대체하는 방식(OR 아님)으로 하고, ch2(FDC)는
+   외장으로 지정하지 못하게 한다.
+5. **ISA PnP 카드**: 설정 포트 279h(쓰기), A79h(쓰기)는 내부에서 쓰지 않는다.
+   READ_DATA 포트(203h–3FFh 중 소프트웨어가 고름)가 내부 점유 포트와 겹치지 않게
+   PnP 설정 도구에서 지정해야 한다(예: 20Bh는 비어 있음).
+6. **SB16의 IDE/CD-ROM 인터페이스**: 170h/1F0h 계열로 설정하면 내부 IDE와 겹친다.
+   비활성화하거나 1E8h/168h로 둔다.
+
 ## 6. 성능 검토
 
 | 항목 | 값 (LCLK 28.33 MHz 기준) |
@@ -395,7 +460,7 @@ DSP 폴링, DMA 오토이닛, IRQ 기반 재생에 모두 충분하다.
 
 1. 스코프로 LCLK 파형과 duty, LAD/LFRAME 링잉 확인.
 2. CPLD 단독: LRESET# 동작, SIDEBAND 프레임 모양.
-3. POST 카드(80h)를 ISA 슬롯에 꽂고 BIOS POST 코드가 보이는지 → I/O 쓰기 경로 확인.
+3. POST 카드(80h, 5.2절의 80h 동시 쓰기 옵션 필요)를 ISA 슬롯에 꽂고 POST 코드가 보이는지 → I/O 쓰기 경로 확인.
 4. OPL 검출(388h AdLib 타이머 테스트) → I/O 읽기/쓰기 확인.
 5. SB DSP 리셋(2x6h) 후 2xAh = `AAh` → DSP I/O 확인.
 6. DSP 명령 `F2h`(IRQ 트리거) → SERIRQ → PIC 경로 확인.
