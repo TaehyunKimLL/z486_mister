@@ -25,11 +25,11 @@ MiSTer User port에 연결해 z486 코어에서 사용하는 것
 
 - 외장 카드의 **아날로그 오디오 출력은 카드의 잭으로 직접 나간다.**
   MiSTer HDMI/아날로그 오디오 믹서로 되돌려 넣는 경로는 없다
-  (User port에 남는 핀이 없고, I/O 보드에 라인 입력이 없다).
+  (남는 핀이 없고, I/O 보드에 라인 입력이 없다).
 
 ## 2. 핀 예산과 전체 구조
 
-### 2.1 LPC에 필요한 신호 vs. User port 7핀
+### 2.1 LPC 신호와 핀 예산
 
 MiSTer User port는 `USER_IO[6:0]` 7핀이다
 (`sys/sys.tcl:31-40`, 3.3-V LVTTL, weak pull-up, max current).
@@ -43,77 +43,53 @@ MiSTer User port는 `USER_IO[6:0]` 7핀이다
 | SERIRQ | 양방향(open-drain) | IRQ |
 | LDRQ# | D→H | DMA |
 
-합계 9핀. 7핀으로 줄이기 위해 **어댑터 보드에 작은 CPLD/FPGA("사이드밴드
-CPLD")를 둔다.** CPLD가 하는 일:
+합계 9핀. **User port 7핀 + Arduino 헤더의 보조 SD 핀 2개**로 9핀을 모두 FPGA에서
+직접 구동한다(기본안). 보조 SD 슬롯은 쓸 수 없게 되며, I/O 보드의 버튼/LED(MCP23009,
+`IO_SCL/IO_SDA`)는 그대로 쓸 수 있다.
 
-1. **LRESET# 생성**: 전원 인가 시 리셋, 그리고 호스트의 "리셋 명령"(4.4절)을 받아 리셋.
-2. **SERIRQ 호스트 역할**: CPLD가 F85226의 SERIRQ 프레임을 직접 돌려서 IRQ 상태를 얻는다.
-3. **LDRQ# 수신**: F85226의 LDRQ# 메시지를 해석한다.
-4. 2와 3의 결과를 **단방향 직렬 프레임 한 줄(SIDEBAND)**로 FPGA에 보낸다.
+- RTC 보드가 꽂히는 DE10-nano **LTC 커넥터는 HPS 핀**이라 FPGA에서 직접 쓸 수 없다.
+  HPS Loan I/O는 MiSTer 전체 preloader 설정을 바꿔야 하고 RTC와 충돌하므로 제외한다.
+- 추가 핀을 쓸 수 없는 환경을 위한 7핀 + 어댑터 CPLD 구성은 부록 A에 남겨 둔다.
 
-FPGA 쪽에서는 SERIRQ/LDRQ 프로토콜을 직접 처리하지 않아도 되고,
-User port 7핀으로 끝난다.
+### 2.2 핀 배치
 
-### 2.2 핀 배치 (제안)
+| FPGA 포트 | 핀 | 신호 | FPGA 방향 | 비고 |
+|---|---|---|---|---|
+| `USER_IO[0]` | AG11 | LAD0 | 양방향 | push-pull, TAR 구간 tri-state |
+| `USER_IO[1]` | AH9 | LAD1 | 양방향 | |
+| `USER_IO[2]` | AH12 | LAD2 | 양방향 | SW[1]=1이면 HDMI I2S로 쓰임 → **SW[1]=0 필수** |
+| `USER_IO[3]` | AH11 | LAD3 | 양방향 | |
+| `USER_IO[4]` | AG16 | LFRAME# | 출력 | SW[1] 공유 핀 |
+| `USER_IO[5]` | AF15 | LCLK | 출력 | DDIO 출력, SW[1] 공유 핀 |
+| `USER_IO[6]` | AF17 | LRESET# | 출력 | 어댑터에 풀다운(4.4절) |
+| `SD_SPI_MOSI` | U13 | SERIRQ | 양방향(open-drain) | 보조 SD MOSI 대체 |
+| `SD_SPI_MISO` | AH8 | LDRQ# | 입력 | 보조 SD MISO 대체 |
 
-| USER_IO | 신호 | FPGA 방향 | 비고 |
-|---|---|---|---|
-| 0 | LAD0 | 양방향 | push-pull, TAR 구간 tri-state |
-| 1 | LAD1 | 양방향 | |
-| 2 | LAD2 | 양방향 | SW[1]=1이면 HDMI I2S로 쓰임 → **SW[1]=0 필수** |
-| 3 | LAD3 | 양방향 | |
-| 4 | LFRAME# | 출력 | SW[1] 공유 핀 |
-| 5 | LCLK | 출력 | DDIO 출력, SW[1] 공유 핀 |
-| 6 | SIDEBAND | 입력 | CPLD → FPGA 직렬 프레임 |
-
-USB3 커넥터 핀 번호와 `USER_IO` 대응은 MiSTer User port 핀아웃 문서를 따른다.
-LAD/LFRAME/LCLK 옆에 GND 핀을 최대한 둔다.
+- `SD_SPI_CS`(AE15)는 sync-on-green 제어에도 쓰이므로 건드리지 않는다.
+  `SD_SPI_CLK`(AG8), `SDCD_SPDIF`(AH7)도 쓰지 않는다.
+- USB3 커넥터 핀 번호와 `USER_IO` 대응은 MiSTer User port 핀아웃 문서를 따른다.
+  LAD/LFRAME/LCLK 옆에 GND 핀을 최대한 둔다.
+- SERIRQ/LDRQ#는 Arduino 헤더에서 점퍼선(또는 I/O 보드 아래 스태킹 헤더)으로 끌어낸다.
+  두 신호도 LCLK에 동기화되어 있으므로 User port 쪽과 배선 길이 차이를 수 ns(수십 cm) 이내로 맞추고,
+  GND 선을 함께 꼬아서 보낸다. I/O 보드의 SD 슬롯 쪽 배선은 스텁으로 남는다(카드를 꽂지 않는다).
 
 ### 2.3 블록 다이어그램
 
 ```
- z486 core (clk_sys 85 MHz)                         어댑터 보드                 dISAppointment
-┌──────────────────────────────────────┐        ┌──────────────────┐        ┌──────────────┐
-│ CPU ─ iobus_adapter ─┐               │        │                  │        │              │
-│                      ├─ lpc_host ────┼─LCLK──►┼──────────────────┼──LCLK─►│              │
-│ dma.v (ext ch) ──────┘   (arbiter,   ├─LFRAME►┼──────────────────┼────────►│  F85226      │
-│                           I/O + DMA) ◄─LAD──► ┼──────────────────┼─LAD───►│  LPC→ISA     ├─ ISA 슬롯
-│                                      │        │  sideband CPLD   ├─LRESET#►│              │  (SB 카드)
-│ pic ◄─ ext_irq ─┐                    │        │  ├ reset gen     ◄─SERIRQ─►│              │
-│ dma ◄─ ext_drq ─┴─ lpc_sideband_rx ◄─┼SIDEBND─┤  ├ SERIRQ host   ◄─LDRQ#──┤              │
-└──────────────────────────────────────┘        │  └ LDRQ decoder  │        └──────────────┘
-                                                └──────────────────┘
+ z486 core (clk_sys 85 MHz)                                          dISAppointment
+┌──────────────────────────────────────────────┐                   ┌──────────────┐
+│ CPU ─ iobus_adapter ─┐                        │  User port        │              │
+│                      ├─ lpc_host ─────────────┼─ LCLK ──────────► │              │
+│ dma.v (ext ch) ──────┘  (arbiter, I/O + DMA)  ├─ LFRAME# ───────► │  F85226      │
+│                                               ◄─ LAD[3:0] ──────► │  LPC→ISA     ├─ ISA 슬롯
+│ core reset ───────────► lpc_reset ────────────┼─ LRESET# ───────► │              │  (SB 카드)
+│                                               │  Arduino 헤더     │              │
+│ pic ◄─ ext_irq ◄─ lpc_serirq_host ◄───────────┼─ SERIRQ ◄───────► │              │
+│ dma ◄─ ext_drq ◄─ lpc_ldrq_rx ◄───────────────┼─ LDRQ# ◄───────── │              │
+└──────────────────────────────────────────────┘                   └──────────────┘
 ```
 
-CPLD는 LAD/LFRAME#를 **입력으로만** 모니터링한다(리셋 명령 감지).
-LAD/LFRAME/LCLK는 CPLD를 거치지 않고 F85226에 직결한다.
-
-### 2.4 대안: 추가 FPGA 핀을 끌어와서 CPLD 없이 구성 (검토 중)
-
-- **RTC 보드 헤더(DE10-nano LTC 커넥터)는 HPS 핀이다.** FPGA 패브릭에서 직접 쓸 수 없다.
-  Cyclone V의 HPS Loan I/O로 빌려 올 수는 있지만, MiSTer 전체의 HPS 핀 설정(preloader)을
-  바꿔야 하고 RTC 기능과도 충돌하므로 제외한다.
-- **Arduino 헤더의 "I/O ALT" 핀은 FPGA 핀이다**(`sys/sys.tcl`, `sys/sys_top.v:98-106`).
-  User port와 같은 3.3 V 뱅크 계열이다.
-
-  | 포트 | 핀 | MiSTer에서의 용도 | 비우면 잃는 기능 |
-  |---|---|---|---|
-  | `SD_SPI_CS` | AE15 | 보조 SD CS, sync-on-green 제어 | 보조 SD, SOG → **피한다** |
-  | `SD_SPI_MISO` | AH8 | 보조 SD | 보조 SD |
-  | `SD_SPI_CLK` | AG8 | 보조 SD | 보조 SD |
-  | `SD_SPI_MOSI` | U13 | 보조 SD | 보조 SD |
-  | `IO_SCL`/`IO_SDA` | U14/AG9 | I/O 보드 v6+ MCP23009(버튼/LED) | I/O 보드 버튼/LED, MCP 감지 |
-  | `SDCD_SPDIF` | AH7 | SD 카드 감지, S/PDIF | 보조 SD 감지, S/PDIF 출력 |
-
-- 2핀(예: `SD_SPI_CLK` → SERIRQ, `SD_SPI_MOSI` → LDRQ#)을 더하면 9핀으로 **LPC 전체를 FPGA가
-  직접 구동**할 수 있다. User port 7핀은 LCLK, LFRAME#, LAD[3:0], LRESET#가 된다.
-  CPLD, SIDEBAND 프레임, DRQ_SEQ는 필요 없어진다(4.2–4.5절은 FPGA 안의 SERIRQ 호스트와
-  LDRQ 디코더로 대체된다).
-- 대가:
-  - I/O 보드가 꽂혀 있으면 해당 신호가 I/O 보드의 SD 슬롯 등에 연결된 상태다.
-    신호를 끌어내려면 스태킹 헤더나 점퍼선이 필요하고, SD 슬롯 쪽 배선이 스텁으로 남는다.
-  - `sys_top.v`의 해당 핀 로직을 매크로로 끊어야 한다(보조 SD 비활성).
-  - SERIRQ와 LDRQ#도 LCLK에 동기화된 신호라서 User port 쪽 배선과 길이를 비슷하게 맞춘다(수 ns 이내).
+어댑터는 능동 소자 없이 배선, 풀업/풀다운 저항, GND 연결만 한다.
 
 ## 3. 물리 계층
 
@@ -135,6 +111,10 @@ LPC에는 push-pull과 핀별 방향 제어가 필요하다.
   (`OUTPUT_TERMINATION "SERIES 50 OHM WITHOUT CALIBRATION"`,
   Cyclone V 3.3-V LVTTL 지원 여부 확인). 안 되면 `CURRENT_STRENGTH`를 낮춰
   링잉을 줄인다.
+- **보조 SD 핀 재할당**: 같은 매크로 아래에서 `SD_SPI_MOSI`를 SERIRQ(open-drain 양방향),
+  `SD_SPI_MISO`를 LDRQ# 입력으로 emu에 넘긴다. `SD_MISO`는 `1'b1`로 고정하고
+  `SD_SPI_CLK/MOSI` 구동을 끊는다(`sys/sys_top.v:133-143`). `SD_SPI_CS`와 SOG 경로는 그대로 둔다.
+  두 포트가 `output`/`input`으로 선언되어 있으므로 `SD_SPI_MOSI`는 `inout`으로 바꾼다.
 - MiSTer 공용 프레임워크(`sys/`) 수정이므로 업스트림 Template 머지 때 충돌 관리가 필요하다.
 
 ### 3.2 LCLK 주파수와 위상
@@ -170,10 +150,10 @@ ISA 카드는 보통 문제 없는 범위다.
 - User port 커넥터에 **직접 꽂는 형태**(케이블 없이, 또는 10 cm 이하)를 권장한다.
 - 풀업: LAD[3:0], LFRAME#, LDRQ#, SERIRQ에 LPC 규격 풀업(10–100 kΩ).
   FPGA 쪽 weak pull-up은 그대로 둔다.
-- CPLD 후보: Lattice MachXO2-256/640 또는 iCE40 UL/LP (3.3 V I/O, 내부 오실레이터 있음).
-  예상 로직은 약 150 LUT.
+- LRESET#: **2.2 kΩ 풀다운**. 다른 코어가 로드되어 핀이 weak pull-up(약 25 kΩ)만 걸린 상태에서도
+  약 0.3 V로 리셋이 유지되게 한다. 10 kΩ 이상이면 중간 전압이 되므로 쓰지 않는다.
 - 전원: ISA 카드용 +5 V/+12 V/−12 V와 dISAppointment 전원은 **외부 ATX/어댑터**에서 공급한다.
-  User port 5 V는 CPLD에만 쓰거나 아예 쓰지 않는다. GND는 반드시 공통으로 묶는다.
+  GND는 반드시 공통으로 묶는다.
 - dISAppointment의 LPC 헤더 핀아웃과 전원 입력 사양은 보드 문서로 확인한다.
 
 ## 4. 프로토콜
@@ -211,60 +191,45 @@ Abort: LFRAME#를 4 LCLK 이상 Low로, LAD=`1111`.
 중재: `lpc_host`는 한 번에 사이클 하나만 처리한다. 대기 중인 요청이 겹치면
 **DMA 요청을 CPU I/O보다 먼저** 처리하고, 진행 중인 사이클은 중단하지 않는다.
 
-### 4.2 SIDEBAND 프레임 (CPLD → FPGA)
+### 4.2 LDRQ# 수신 (FPGA `lpc_ldrq_rx`)
 
-LCLK에 동기화해 계속 반복 전송한다. CPLD는 LCLK 상승에서 출력하고,
-FPGA는 `lpc_host`와 같은 샘플 위상에서 읽는다.
+- 메시지: START `0`, CHANNEL[2:0] (MSB 먼저), ACT 1비트, 이후 idle `1`. `lpc_host`와 같은
+  샘플 위상에서 LCLK마다 1비트씩 읽는다.
+- 입력은 2단 동기화 없이 IOE 입력 레지스터로 바로 받는다(LCLK에 동기화된 신호이므로
+  `lpc_host`의 샘플 위상 규칙을 그대로 적용).
 
-| 비트 | 길이 | 내용 |
-|---|---|---|
-| IDLE | 2 | `1` |
-| START | 1 | `0` |
-| IRQ[15:0] | 16 | 각 IRQ의 현재 레벨 (1 = asserted, bit0 먼저) |
-| DRQ_ACT[7:0] | 8 | 채널별 마지막 LDRQ 메시지의 ACT 값 (ch4 = 0 고정) |
-| DRQ_SEQ[7:0][1:0] | 16 | 채널별 ACT=1 메시지 수 (mod 4) |
-| PARITY | 1 | 앞 40비트의 짝수 패리티 |
-| 합계 | **44 LCLK** | 28.33 MHz에서 약 1.55 µs 주기 |
+### 4.3 DRQ 래치 (LDRQ 의미 보존)
 
-- FPGA는 패리티가 틀린 프레임을 버린다. IRQ와 DRQ_ACT는 레벨이고 DRQ_SEQ는 카운터라서,
-  프레임 하나를 잃어도 다음 프레임에서 상태가 복구된다.
-- DRQ_SEQ가 필요한 이유: 싱글 모드 DMA에서는 매 전송 뒤 디바이스가 LDRQ ACT=1을
-  **다시 보낸다.** 레벨만 보내면 "전송 완료 → 새 요청" 사이의 에지를 FPGA가 놓칠 수 있다.
-
-### 4.3 FPGA 쪽 DRQ 복원 (LDRQ 의미 보존)
-
-채널마다 LPC 호스트와 똑같은 의미의 `ext_drq[ch]` 래치를 둔다.
+채널마다 LPC 호스트 규격과 같은 의미의 `ext_drq[ch]` 래치를 둔다.
 
 ```
-set   : DRQ_SEQ[ch]가 이전 프레임 값과 다를 때
-clear : DRQ_ACT[ch]가 0으로 바뀌었을 때
+set   : LDRQ 메시지 (ch, ACT=1)
+clear : LDRQ 메시지 (ch, ACT=0)
         또는 ch에 대한 LPC DMA 사이클이 SYNC=Ready(0000)로 끝났을 때
 keep  : SYNC=Ready More(1001)로 끝났을 때 (디맨드/블록 전송)
 ```
 
-사이드밴드 지연(최대 약 3 µs) 동안 이미 서비스한 요청을 다시 보는 문제는
-"사이클 완료 시 clear + SEQ 변화로만 set" 규칙으로 막는다.
+싱글 모드에서는 디바이스가 매 전송 뒤 ACT=1을 다시 보낸다. 사이클 완료로 clear한 뒤
+새 메시지로만 set되므로 이미 서비스한 요청을 두 번 처리하지 않는다.
 
-### 4.4 LRESET# (CPLD)
+### 4.4 LRESET# (FPGA 직접 구동)
 
-- 전원 인가: CPLD 내부 POR 뒤 LCLK를 감지하면 약 1 ms 동안 LRESET# Low를 유지한 뒤 해제.
-- 리셋 명령: **LFRAME#=0이고 LAD=`1111`인 상태가 64 LCLK 이상 계속되면**
-  LRESET#를 Low로 내리고, 조건이 풀린 뒤 약 1 ms(2^15 LCLK) 더 유지한다.
-  정상 abort는 4–8 LCLK이므로 오검출되지 않는다.
-- LCLK 소실: CPLD 내부 오실레이터로 LCLK가 약 10 µs 이상 멈춘 것을 감지하면 LRESET# Low.
-  코어 재로드나 다른 코어로 전환될 때 카드를 리셋 상태로 둔다.
-- z486 쪽: 코어 리셋(`reset`, OSD Reset) 동안 `lpc_host`가 리셋 명령 상태를 유지한다.
-  이 동안 LCLK는 계속 출력한다(LPC 규격상 리셋 중에도 클럭 필요).
+- 코어 리셋(`reset`, OSD Reset) 동안, 그리고 OSD에서 LPC를 끈 동안 Low.
+- 리셋 해제 뒤에도 최소 1 ms(2^15 LCLK) 더 Low를 유지한다. LCLK는 리셋 중에도 계속 출력한다
+  (LPC 규격상 리셋 중에도 클럭 필요).
+- 코어가 로드되지 않았거나 다른 코어일 때는 어댑터의 2.2 kΩ 풀다운으로 리셋 상태를 유지한다.
 
-### 4.5 SERIRQ (CPLD가 호스트)
+### 4.5 SERIRQ (FPGA `lpc_serirq_host`)
 
-- CPLD는 **continuous 모드**로 계속 동작한다: start frame(LCLK 기준 Low 8클럭),
-  슬롯당 3클럭(sample/recovery/turnaround), 뒤에 stop frame.
+- **continuous 모드**로 계속 동작한다: start frame(Low 8 LCLK), 슬롯당 3 LCLK
+  (sample/recovery/turnaround), 뒤에 stop frame(Low 3 LCLK = continuous 유지).
+  한 프레임 약 60 LCLK ≈ 2.1 µs.
 - 슬롯 매핑: 0 = IRQ0, 1 = IRQ1, 2 = SMI#(무시), 3–15 = IRQ3–15, 16 = IOCHCK#(무시).
 - 슬롯 극성(ISA active-high IRQ를 어떤 레벨로 싣는지)은 SERIRQ 규격과 F85226 데이터시트로
-  확정한다. CPLD에 극성 파라미터를 둔다.
-- 아무도 구동하지 않는 슬롯은 풀업으로 떠 있다. FPGA 쪽 `ext_irq_mask`로 **사용할 IRQ만**
+  확정한다. 파라미터로 둔다.
+- 아무도 구동하지 않는 슬롯은 풀업으로 떠 있다. `ext_irq_mask`로 **사용할 IRQ만**
   통과시켜서 잘못된 인터럽트를 막는다.
+- 출력은 open-drain(Low 또는 Z)이고, start/stop frame에서만 Low를 구동한다.
 
 ## 5. z486 코어 RTL 변경
 
@@ -272,10 +237,11 @@ keep  : SYNC=Ready More(1001)로 끝났을 때 (디맨드/블록 전송)
 
 | 파일 | 역할 | 예상 규모 |
 |---|---|---|
-| `src/lpc/lpc_host.sv` | LPC 사이클 FSM (I/O, DMA), SYNC/타임아웃/abort, 리셋 명령, LCLK DDIO 입력 생성 | 약 400 ALM |
-| `src/lpc/lpc_sideband_rx.sv` | SIDEBAND 역직렬화, 패리티 검사, `ext_irq[15:0]`, DRQ_ACT/SEQ | 약 100 ALM |
+| `src/lpc/lpc_host.sv` | LPC 사이클 FSM (I/O, DMA), SYNC/타임아웃/abort, LRESET#, LCLK DDIO 입력 생성 | 약 400 ALM |
+| `src/lpc/lpc_serirq_host.sv` | SERIRQ continuous 모드 호스트, `ext_irq[15:0]` | 약 60 ALM |
+| `src/lpc/lpc_ldrq_rx.sv` | LDRQ# 메시지 디코드 | 약 20 ALM |
 | `src/lpc/lpc_drq.sv` | 채널별 `ext_drq` 래치 (4.3절) | 약 30 ALM |
-| `tests/lpc/*` | LPC 디바이스 BFM + CPLD 모델 테스트벤치 | – |
+| `tests/lpc/*` | LPC 디바이스 BFM(SERIRQ/LDRQ 포함) 테스트벤치 | – |
 
 ### 5.2 I/O 경로: `src/iobus_adapter.sv`, `src/system.sv`
 
@@ -362,6 +328,7 @@ transfer==0 (Verify), ext:
 
 - User port 소유권: LPC 모드를 켜면 `USER_OUT/USER_OE`를 `lpc_host`가 쓰고
   **MT32-pi(`mt32pi` 인스턴스)와 User port UART/MIDI는 비활성화**한다.
+- 보조 SD: LPC 빌드(매크로 사용)에서는 보조 SD 슬롯을 쓸 수 없다. 이 기능은 빌드 옵션으로 둔다.
 - OSD 항목(제안):
   - `ISA via User port: Off / On`
   - `External sound card: Off / SB (220h, IRQ 5, DMA 1/5) / Custom`
@@ -412,7 +379,8 @@ transfer==0 (Verify), ext:
 | 8-bit DMA 1전송 | 약 12 LCLK + ISA DMA 사이클 ≈ 1–1.5 µs |
 | SB Pro 44.1 kHz 스테레오 8-bit | 88.2 k전송/s → 11.3 µs 간격 → LPC 점유율 약 13% |
 | SB16 44.1 kHz 스테레오 16-bit (DMA5) | 88.2 k워드/s → 점유율 약 15% |
-| IRQ/DRQ 지연 | SERIRQ 1프레임(약 2–3 µs) + SIDEBAND 1프레임(1.55 µs) ≲ 5 µs |
+| IRQ 지연 | SERIRQ 1프레임 ≈ 2.1 µs 이하 |
+| DRQ 지연 | LDRQ 메시지 5 LCLK ≈ 0.2 µs |
 
 DSP 폴링, DMA 오토이닛, IRQ 기반 재생에 모두 충분하다.
 
@@ -436,30 +404,32 @@ DSP 폴링, DMA 오토이닛, IRQ 기반 재생에 모두 충분하다.
 | 28 MHz 신호 품질 (커넥터, 크로스토크, 링잉) | 간헐 오류 | 직결 어댑터, GND 확보, OCT/전류 설정, 21 MHz 폴백, 샘플 위상 파라미터 |
 | sys_top 수정 | 업스트림 머지 충돌 | 매크로로 분리, 변경 최소화 |
 | User port 공유 (MT32-pi, UART, SW[1] HDMI I2S) | 동시 사용 불가 | OSD 배타 선택, 문서화 |
-| SERIRQ 슬롯 극성 해석 | IRQ 반전 | CPLD 극성 파라미터 |
+| SERIRQ 슬롯 극성 해석 | IRQ 반전 | 극성 파라미터 |
+| Arduino 헤더 점퍼 배선(SERIRQ/LDRQ#) | 간헐 IRQ/DMA 오류 | 짧은 배선, GND 동반, 21 MHz 폴백 |
+| 보조 SD 핀 재할당 | 보조 SD 사용 불가 | 매크로로 분리, OSD/문서에 명시 |
 | subtractive decode로 모든 미사용 포트가 외부로 나감 | 포트 스캔이 느려짐 | 실제 ISA와 동일, 필요하면 포트 창 제한 옵션 |
-| DMA 싱글 모드 요청 재발행 경쟁 | 누락 또는 중복 전송 | DRQ_SEQ 카운터와 완료 시 clear 규칙(4.3절), 시뮬레이션으로 검증 |
+| DMA 싱글 모드 요청 재발행 경쟁 | 누락 또는 중복 전송 | 완료 시 clear 규칙(4.3절), 시뮬레이션으로 검증 |
 
 ## 9. 검증 계획
 
 ### 9.1 시뮬레이션 (Verilator, `tests/lpc/`)
 
 1. LPC 디바이스 BFM: I/O 레지스터 파일, SYNC 대기(short/long/none/error) 주입.
-2. CPLD 동작 모델: SIDEBAND 프레임 생성, 패리티 오류 주입, LDRQ 메시지 → SEQ/ACT.
+2. BFM에 SERIRQ 슬롯 구동, LDRQ# 메시지 생성 기능을 넣는다.
 3. 테스트:
    - I/O 읽기/쓰기, 32-bit `IN`/`OUT` 바이트 분할, 타임아웃 시 `FF`
    - 내부 칩셀렉트 포트는 LPC로 나가지 않는지 (subtractive decode)
    - 8-bit DMA read/write, 오토이닛, TC 비트, Ready More
    - 16-bit DMA (ch5)
    - 싱글 모드 연속 요청에서 전송 수 = 요청 수
-   - SIDEBAND 프레임 손실 시 복구
-   - 리셋 명령(LFRAME# Low 64 LCLK 이상) 발생 조건
+   - SERIRQ 프레임 해석과 `ext_irq_mask`
+   - LRESET# 최소 유지 시간
 4. 기존 `verilator/` 부팅 시뮬레이션 회귀: LPC 모드 Off에서 동작이 바뀌지 않는지.
 
 ### 9.2 하드웨어 bring-up
 
 1. 스코프로 LCLK 파형과 duty, LAD/LFRAME 링잉 확인.
-2. CPLD 단독: LRESET# 동작, SIDEBAND 프레임 모양.
+2. LRESET# 동작, SERIRQ start/stop frame 파형, LDRQ# 레벨 확인(점퍼 배선 포함).
 3. POST 카드(80h, 5.2절의 80h 동시 쓰기 옵션 필요)를 ISA 슬롯에 꽂고 POST 코드가 보이는지 → I/O 쓰기 경로 확인.
 4. OPL 검출(388h AdLib 타이머 테스트) → I/O 읽기/쓰기 확인.
 5. SB DSP 리셋(2x6h) 후 2xAh = `AAh` → DSP I/O 확인.
@@ -471,12 +441,35 @@ DSP 폴링, DMA 오토이닛, IRQ 기반 재생에 모두 충분하다.
 
 | 단계 | 내용 | 완료 기준 |
 |---|---|---|
-| P0 | sys_top push-pull/OE/DDIO 옵션, LCLK 출력 | 스코프로 28.33 MHz 확인 |
+| P0 | sys_top push-pull/OE/DDIO 옵션, 보조 SD 핀 재할당, LCLK 출력 | 스코프로 28.33 MHz 확인 |
 | P1 | `lpc_host` I/O, `iobus_adapter` wait, subtractive decode | POST 카드, OPL 검출 |
-| P2 | 어댑터 CPLD(리셋, SERIRQ, LDRQ, SIDEBAND), `lpc_sideband_rx`, IRQ 연결 | DSP F2h IRQ |
-| P3 | `lpc_host` DMA 사이클, `dma.v` ext 경로, `lpc_drq` | SB 8-bit DMA 재생 |
+| P2 | `lpc_serirq_host`, IRQ 연결 | DSP F2h IRQ |
+| P3 | `lpc_ldrq_rx`, `lpc_drq`, `lpc_host` DMA 사이클, `dma.v` ext 경로 | SB 8-bit DMA 재생 |
 | P4 | 16-bit DMA, OSD 정리, 문서화 | SB16 16-bit 재생 |
 | (선택) P5 | ISA 메모리 사이클 | 옵션 ROM 인식 |
+
+## 부록 A. 7핀 구성 (추가 핀을 쓸 수 없는 경우)
+
+보조 SD 핀을 쓸 수 없으면 어댑터에 작은 CPLD(MachXO2-256/640, iCE40 UL/LP 등, 약 150 LUT)를 둔다.
+
+- User port: LAD[3:0], LFRAME#, LCLK, **SIDEBAND**(CPLD → FPGA 입력).
+- CPLD가 LRESET#를 생성한다: 전원 인가 시 약 1 ms, 호스트의 "리셋 명령"
+  (LFRAME#=0, LAD=`1111`이 64 LCLK 이상 지속, 정상 abort는 4–8 LCLK라 오검출 없음),
+  내부 오실레이터로 LCLK 소실(약 10 µs)을 감지했을 때.
+- CPLD가 SERIRQ 호스트와 LDRQ# 디코더를 맡고, 결과를 SIDEBAND 프레임으로 보낸다.
+
+| 비트 | 길이 | 내용 |
+|---|---|---|
+| IDLE | 2 | `1` |
+| START | 1 | `0` |
+| IRQ[15:0] | 16 | IRQ 레벨 |
+| DRQ_ACT[7:0] | 8 | 채널별 마지막 LDRQ ACT 값 |
+| DRQ_SEQ[7:0][1:0] | 16 | 채널별 ACT=1 메시지 수 (mod 4) |
+| PARITY | 1 | 앞 40비트 짝수 패리티 |
+| 합계 | 44 LCLK | 28.33 MHz에서 약 1.55 µs |
+
+FPGA는 DRQ_SEQ가 바뀌면 `ext_drq`를 set하고, 나머지 규칙은 4.3절과 같다.
+패리티 오류 프레임은 버리고, 레벨/카운터 구조라 다음 프레임에서 복구된다.
 
 ## 참고
 
